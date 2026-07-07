@@ -24,6 +24,7 @@ weights/
 __pycache__/
 *.pyc
 .DS_Store
+.vscode/
 
 # 5.排除缝纫相关大文件
 sewing/
