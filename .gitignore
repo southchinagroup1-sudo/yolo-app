@@ -1,0 +1,30 @@
+# === YOLO 项目专属防御网 ===
+
+# 1. 数据集（注意：没有s）
+dataset/
+
+# 2. YOLO 训练产生的海量垃圾（权重、图表、结果）
+runs/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# 3. 各类媒体与表格
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.xlsx
+*.csv
+
+# 4. 系统与缓存垃圾
+__pycache__/
+*.pyc
+.DS_Store
+
+# 5.排除缝纫相关大文件
+sewing/
+sewing.zip
