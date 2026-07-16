@@ -16,15 +16,17 @@ jobs:
         
     - name: Install Dependencies
       run: |
+        cd industrial_vision_app
         python -m pip install --upgrade pip
-        pip install ultralytics torch torchvision PySide6 opencv-python pandas matplotlib openpyxl pyinstaller
+        pip install -r requirements.txt
         
     - name: Build EXE
       run: |
+        cd industrial_vision_app
         pyinstaller --noconsole --onefile --collect-all ultralytics --collect-all PySide6 --collect-all torch main.py
         
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Industrial-Vision-EXE
-        path: dist/main.exe
+        path: industrial_vision_app/dist/main.exe
