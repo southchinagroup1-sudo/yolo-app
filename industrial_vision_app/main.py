@@ -16,6 +16,7 @@ from enum import Enum, auto
 import threading
 import queue
 from collections import deque
+import logging
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QImage, QPixmap, QColor
@@ -25,7 +26,98 @@ from PySide6.QtWidgets import (
     QHeaderView, QFileDialog, QMessageBox,
     QSplitter, QSizePolicy, QProgressBar, QFrame
 )
-from ultralytics import YOLO
+import onnxruntime as ort
+
+# 屏蔽 ONNX Runtime 底层因环境缺失产生的红字警告
+logging.basicConfig(level=logging.ERROR)
+ort.set_default_logger_severity(3)
+
+# ═══════════════════════════════════════════════════════════════
+# 极致推理引擎 (专为 Windows 异构加速设计)
+# ═══════════════════════════════════════════════════════════════
+
+class YOLO_ONNX_Detector:
+    def __init__(self, model_path: str):
+        available = ort.get_available_providers()
+        self.session = None
+        self.active_device = "CPU"
+
+        # 优先级 1: CUDA (Windows 下 N 卡加速的绝对主力)
+        if 'CUDAExecutionProvider' in available:
+            try:
+                self.session = ort.InferenceSession(model_path, providers=['CUDAExecutionProvider'])
+                self.active_device = "GPU (CUDA)"
+            except Exception:
+                pass # 如果 CUDA 加载失败，静默跳过，尝试下一个
+
+        # 优先级 2: 纯 CPU 兜底 (保证在任何 Windows 电脑上都能跑)
+        if self.session is None:
+            self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            self.active_device = "CPU"
+            
+        self.input_name = self.session.get_inputs()[0].name
+        self.imgsz = 640
+
+    def _letterbox(self, img: np.ndarray):
+        h, w = img.shape[:2]
+        r = min(self.imgsz / h, self.imgsz / w)
+        new_h, new_w = int(h * r), int(w * r)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.imgsz, self.imgsz, 3), 114, dtype=np.uint8)
+        top = (self.imgsz - new_h) // 2
+        left = (self.imgsz - new_w) // 2
+        canvas[top:top + new_h, left:left + new_w] = resized
+        return canvas, r, (left, top)
+
+    def _preprocess(self, frame: np.ndarray):
+        canvas, r, (left, top) = self._letterbox(frame)
+        canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        canvas = canvas.astype(np.float32) / 255.0
+        canvas = canvas.transpose(2, 0, 1)[None]  # [1, 3, 640, 640]
+        return canvas, r, left, top, frame.shape[:2]
+
+    def _postprocess(self, output: np.ndarray, r: float, left: int, top: int, orig_shape: tuple):
+        output = output[0].T  # [8400, 5] or [8400, 6]
+        scores = output[:, 4:].max(axis=1)
+        mask = scores > 0.5
+        
+        if not np.any(mask):
+            return np.zeros((0, 6), dtype=np.float32)
+            
+        boxes_xywh = output[mask, :4]
+        scores = scores[mask]
+        
+        boxes_xyxy = np.zeros((len(boxes_xywh), 4), dtype=np.float32)
+        boxes_xyxy[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
+        boxes_xyxy[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
+        boxes_xyxy[:, 2] = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2
+        boxes_xyxy[:, 3] = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2
+        
+        indices = cv2.dnn.NMSBoxes(boxes_xyxy.tolist(), scores.tolist(), 0.5, 0.45)
+        if len(indices) == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+            
+        indices = np.array(indices).flatten()
+        boxes_xyxy = boxes_xyxy[indices]
+        scores = scores[indices]
+        
+        orig_h, orig_w = orig_shape
+        boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - left) / r
+        boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - top) / r
+        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
+        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
+        
+        cls_arr = np.zeros((len(boxes_xyxy), 1), dtype=np.float32)
+        return np.concatenate([boxes_xyxy, scores[:, None], cls_arr], axis=1)
+
+    def predict(self, frames: list):
+        all_boxes = []
+        for frame in frames:
+            blob, r, left, top, orig_shape = self._preprocess(frame)
+            outputs = self.session.run(None, {self.input_name: blob})[0]
+            boxes = self._postprocess(outputs, r, left, top, orig_shape)
+            all_boxes.append(boxes)
+        return all_boxes
 
 # ═══════════════════════════════════════════════════════════════
 # 数据层：不可变事件溯源
@@ -47,13 +139,10 @@ class ActionEvent:
 
     def to_dict(self) -> dict:
         return {
-            'action_index': self.index,
-            'start_time': self.start_time,
-            'end_time': self.end_time,
-            'duration': self.duration,
+            'action_index': self.index, 'start_time': self.start_time,
+            'end_time': self.end_time, 'duration': self.duration,
             'status': '异常' if self.status == ActionStatus.ABNORMAL else '正常',
-            'start_frame': self.start_frame,
-            'end_frame': self.end_frame
+            'start_frame': self.start_frame, 'end_frame': self.end_frame
         }
 
 @dataclass
@@ -310,7 +399,7 @@ class SpatialAnchorTracker:
             return None, self.ref_box
 
 # ═══════════════════════════════════════════════════════════════
-# 预处理线程 (重构：异构自适应加速)
+# 预处理线程
 # ═══════════════════════════════════════════════════════════════
 
 class PreprocessThread(QThread):
@@ -318,7 +407,7 @@ class PreprocessThread(QThread):
     finished = Signal(object, list)
     error = Signal(str)
 
-    def __init__(self, video_path: str, model_path: str, batch_size: int = 32):
+    def __init__(self, video_path: str, model_path: str, batch_size: int = 16):
         super().__init__()
         self.video_path = video_path
         self.model_path = model_path
@@ -328,7 +417,7 @@ class PreprocessThread(QThread):
         self._is_cancelled = False
         self._frame_queue = queue.Queue(maxsize=512)
         self.detection_history = []
-        self.device = 'cpu'  # 默认 CPU，后续自动检测
+        self.model = None
 
     def cancel(self):
         self._is_cancelled = True
@@ -358,17 +447,7 @@ class PreprocessThread(QThread):
 
     def run(self):
         try:
-            # 硬件自适应检测
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    self.device = 'cuda:0'
-            except ImportError:
-                pass
-
-            model = YOLO(self.model_path)
-            if self.device == 'cuda:0':
-                model.to(self.device).half()  # 有 N 卡：GPU + 半精度加速
+            self.model = YOLO_ONNX_Detector(self.model_path)
             
             meta = VideoMetadata(self.video_path)
             self.detection_history = [None] * meta.total_frames
@@ -385,12 +464,12 @@ class PreprocessThread(QThread):
                 batch_frames.append(frame)
                 batch_indices.append(idx)
                 if len(batch_frames) >= self.batch_size:
-                    self._process_batch(model, meta, batch_frames, batch_indices)
+                    self._process_batch(meta, batch_frames, batch_indices)
                     batch_frames.clear()
                     batch_indices.clear()
 
             if not self._is_cancelled and batch_frames:
-                self._process_batch(model, meta, batch_frames, batch_indices)
+                self._process_batch(meta, batch_frames, batch_indices)
 
             reader_thread.join()
             if not self._is_cancelled:
@@ -399,14 +478,9 @@ class PreprocessThread(QThread):
         except Exception as e:
             self.error.emit(f"推理主线程异常: {str(e)}")
 
-    def _process_batch(self, model, meta, batch_frames, batch_indices):
-        # 动态传参：无 N 卡时 half=False 防止崩溃
-        results = model.predict(
-            source=batch_frames, conf=0.5, verbose=False,
-            device=self.device, half=(self.device == 'cuda:0'), batch=len(batch_frames)
-        )
-        for i, res in enumerate(results):
-            boxes_data = res.boxes.data.cpu().numpy()
+    def _process_batch(self, meta, batch_frames, batch_indices):
+        all_boxes = self.model.predict(frames=batch_frames)
+        for i, boxes_data in enumerate(all_boxes):
             valid_box, current_ref = self.tracker.update(boxes_data)
             
             detected = valid_box is not None
@@ -414,15 +488,9 @@ class PreprocessThread(QThread):
             self.sm.process(detected, time_sec, batch_indices[i])
 
             if detected:
-                self.detection_history[batch_indices[i]] = {
-                    'box': valid_box.reshape(1, -1),
-                    'ref': current_ref
-                }
+                self.detection_history[batch_indices[i]] = {'box': valid_box.reshape(1, -1), 'ref': current_ref}
             else:
-                self.detection_history[batch_indices[i]] = {
-                    'box': None,
-                    'ref': current_ref
-                }
+                self.detection_history[batch_indices[i]] = {'box': None, 'ref': current_ref}
 
         last_idx = batch_indices[-1] + 1
         progress = min(100, int((last_idx / meta.total_frames) * 100)) if meta.total_frames else 100
@@ -528,7 +596,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("工业视觉效能透视终端 V9.9 — 绝对刚性死守架构")
+        self.setWindowTitle("工业视觉效能透视终端 V13.0 — 极致异构级联架构")
         sg = QApplication.primaryScreen().availableGeometry()
         self.resize(min(2560, max(1200, int(sg.width() * 0.9))),
                     min(1440, max(800, int(sg.height() * 0.9))))
@@ -653,7 +721,7 @@ class MainWindow(QMainWindow):
         self.btn_model = QPushButton("🧠 导入模型")
         self.btn_model.setObjectName("ModelBtn")
         self.btn_model.setCursor(Qt.PointingHandCursor)
-        self.btn_model.setToolTip("导入 YOLO 检测模型 (.pt / .engine / .onnx)")
+        self.btn_model.setToolTip("导入 ONNX 检测模型")
         self.btn_model.clicked.connect(self._import_model)
 
         self.btn_load = QPushButton("📁 导入视频")
@@ -690,7 +758,7 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.lbl_time)
         root.addLayout(ctrl)
 
-        self.lbl_status = QLabel(" 系统就绪 — 请导入模型与视频开始分析")
+        self.lbl_status = QLabel(" 系统就绪 — 请导入 ONNX 模型与视频开始分析")
         status_style = (f"font-size:12px; color:#58a6ff; background:rgba(13, 20, 35, 0.6);"
                         f"padding:6px 12px; border-left:3px solid #58a6ff;"
                         f"font-family:{self.F_MO}; border-radius:2px;")
@@ -815,7 +883,7 @@ class MainWindow(QMainWindow):
         engine_panel.setObjectName("EnginePanel")
         engine_layout = QVBoxLayout(engine_panel)
         engine_layout.setContentsMargins(8, 4, 8, 4)
-        self.lbl_engine_status = QLabel("⚙ 自适应引擎: 待机中...")
+        self.lbl_engine_status = QLabel("⚙ 异构引擎: 待机中...")
         self.lbl_engine_status.setStyleSheet(
             f"font-size:12px; color:#8b949e; font-family:{self.F_MO}; border:none;")
         self.lbl_engine_status.setAlignment(Qt.AlignCenter)
@@ -863,21 +931,17 @@ class MainWindow(QMainWindow):
         root.addWidget(self.main_splitter, stretch=1)
 
     def _load_model(self):
-        # 修改为相对路径，完美兼容 Windows exe 运行
-        paths = [
-            "best.pt", "best.onnx", "model/best.pt", "weights/best.pt"
-        ]
+        paths = ["best.onnx", "model/best.onnx", "weights/best.onnx"]
         for p in paths:
             if Path(p).exists():
                 try:
-                    self.model = YOLO(p)
                     self.model_path = p
                     self._update_model_btn(Path(p).stem)
                     self._set_status(f"默认模型已加载: {Path(p).name}", "success")
                     return True
                 except Exception:
                     continue
-        self._set_status("⚠ 未找到默认模型，请点击 [🧠 导入模型] 选择 .pt 文件", "warning")
+        self._set_status("⚠ 未找到默认模型，请点击 [🧠 导入模型] 选择 .onnx 文件", "warning")
         return False
 
     def _import_model(self):
@@ -890,35 +954,22 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ 播放")
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 YOLO 检测模型", "",
-            "YOLO 模型文件 (*.pt *.engine *.onnx);;PyTorch 模型 (*.pt);;TensorRT 引擎 (*.engine);;ONNX 模型 (*.onnx)")
+            self, "选择 ONNX 检测模型", "",
+            "ONNX 模型文件 (*.onnx)")
         if not path: return
         if not Path(path).exists():
             QMessageBox.critical(self, "文件不存在", f"路径无效:\n{path}")
             return
 
-        old_model = self.model
         try:
             self._set_status(f"正在加载模型: {Path(path).name} ...", "warning")
             QApplication.processEvents()
-            new_model = YOLO(path)
-            if not hasattr(new_model, 'predict'):
-                raise ValueError("非有效 YOLO 模型")
             
-            self.model = new_model
             self.model_path = path
-            if old_model is not None:
-                del old_model
-                try:
-                    import torch
-                    if torch.cuda.is_available(): torch.cuda.empty_cache()
-                except: pass
-            
             self._update_model_btn(Path(path).stem)
             self._set_status(f"✓ 模型加载成功: {Path(path).name}", "success")
             self._reset_video_state()
         except Exception as e:
-            self.model = old_model
             self._set_status(f"✗ 模型加载失败: {str(e)[:80]}", "error")
             QMessageBox.critical(self, "模型加载失败", f"错误详情:\n{str(e)}")
 
@@ -955,7 +1006,7 @@ class MainWindow(QMainWindow):
             f"font-family:{self.F_MO}; border-radius:2px;")
 
     def _load_video(self):
-        if not self.model:
+        if not self.model_path:
             QMessageBox.warning(self, "警告", "模型未加载，请先点击 [🧠 导入模型]")
             return
         if self.is_preprocessing:
@@ -995,9 +1046,9 @@ class MainWindow(QMainWindow):
         self._clear_tables()
 
         self.is_preprocessing = True
-        self.lbl_original.setText("GPU 加速中...")
+        self.lbl_original.setText("异构级联加速中...")
         self.lbl_annotated.setText("AI 推理中...")
-        self._set_status("正在调用异构算力极速预处理...", "warning")
+        self._set_status("正在调用 ONNX Runtime 极速预处理...", "warning")
 
         self.lbl_progress.setVisible(True)
         self.progress_bar.setVisible(True)
@@ -1006,9 +1057,7 @@ class MainWindow(QMainWindow):
         self.lbl_engine_status.setStyleSheet(
             f"font-size:12px; color:#ffa500; font-family:{self.F_MO}; border:none;")
 
-        self.preprocess_thread = PreprocessThread(
-            path, self.model_path if self.model_path else "best.pt"
-        )
+        self.preprocess_thread = PreprocessThread(path, self.model_path)
         self.preprocess_thread.progress.connect(self._on_preprocess_progress)
         self.preprocess_thread.finished.connect(self._on_preprocess_finished)
         self.preprocess_thread.error.connect(self._on_preprocess_error)
@@ -1021,15 +1070,24 @@ class MainWindow(QMainWindow):
         self.current_result = result
         self._update_stats_ui(result)
 
+        # 获取当前真正使用的硬件设备
+        device_name = getattr(self.preprocess_thread.model, 'active_device', 'CPU')
+
         if self.preprocess_thread.sm._is_bootstrapped:
             min_b = self.preprocess_thread.sm.current_dyn_min
             max_b = self.preprocess_thread.sm.current_dyn_max
             win_size = len(self.preprocess_thread.sm.duration_window)
             anchor_status = "已焊死" if self.preprocess_thread.tracker.ref_box is not None else "锚定中..."
             self.lbl_engine_status.setText(
-                f"⚙ 引擎: 物理锚点{anchor_status} | 窗口:{win_size} | 临时边界: {min_b:.1f}s-{max_b:.1f}s")
+                f"⚙ 引擎 [{device_name}]: 锚点{anchor_status} | 窗口:{win_size} | 边界: {min_b:.1f}s-{max_b:.1f}s")
+            # 如果是 GPU 就显示青色，如果是 CPU 就显示橙色
+            color = "#00ff9d" if "GPU" in device_name else "#ffa500"
             self.lbl_engine_status.setStyleSheet(
-                f"font-size:12px; color:#00ff9d; font-family:{self.F_MO}; border:none;")
+                f"font-size:12px; color:{color}; font-family:{self.F_MO}; border:none;")
+        else:
+            self.lbl_engine_status.setText(f"⚙ 引擎 [{device_name}]: 绝对刚性锚定与流式预判中...")
+            self.lbl_engine_status.setStyleSheet(
+                f"font-size:12px; color:#ffa500; font-family:{self.F_MO}; border:none;")
 
     def _on_preprocess_finished(self, result, detection_history):
         self.is_preprocessing = False
