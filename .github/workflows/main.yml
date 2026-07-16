@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows EXE (ONNX GPU)
 
 on:
   workflow_dispatch:
@@ -7,26 +7,32 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
+    - name: 1. 拉取代码
+      uses: actions/checkout@v4
     
-    - name: Setup Python
+    - name: 2. 配置 Python 环境
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
         
-    - name: Install Dependencies
+    - name: 3. 安装极简依赖与 GPU 推理库
       run: |
-        cd industrial_vision_app
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install -r industrial_vision_app/requirements.txt
         
-    - name: Build EXE
+    - name: 4. 执行打包 (目录模式)
       run: |
         cd industrial_vision_app
-        pyinstaller --noconsole --onefile --collect-all ultralytics --collect-all PySide6 --collect-all torch main.py
+        pyinstaller --noconsole --onedir --collect-all PySide6 --collect-all onnxruntime --collect-all onnxruntime-gpu main.py
         
-    - name: Upload Artifact
+    - name: 5. 压缩交付目录
+      run: |
+        cd industrial_vision_app/dist
+        # 将 main 文件夹压缩成一个 zip，方便下载
+        Compress-Archive -Path main -DestinationPath Industrial-Vision-App.zip
+        
+    - name: 6. 上传构建产物
       uses: actions/upload-artifact@v4
       with:
-        name: Industrial-Vision-EXE
-        path: industrial_vision_app/dist/main.exe
+        name: Industrial-Vision-ONNX-App
+        path: industrial_vision_app/dist/Industrial-Vision-App.zip
