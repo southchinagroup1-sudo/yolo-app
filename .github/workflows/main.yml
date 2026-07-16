@@ -1,0 +1,30 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install ultralytics torch torchvision PySide6 opencv-python pandas matplotlib openpyxl pyinstaller
+        
+    - name: Build EXE
+      run: |
+        pyinstaller --noconsole --onefile --collect-all ultralytics --collect-all PySide6 --collect-all torch main.py
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: Industrial-Vision-EXE
+        path: dist/main.exe
