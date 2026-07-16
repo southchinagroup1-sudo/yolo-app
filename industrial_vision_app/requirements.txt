@@ -1,7 +1,8 @@
-ultralytics
 PySide6
 opencv-python
+numpy
 pandas
 matplotlib
 openpyxl
+onnxruntime-gpu
 pyinstaller
