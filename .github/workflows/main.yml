@@ -29,10 +29,10 @@ jobs:
       run: |
         cd industrial_vision_app/dist
         # 将 main 文件夹压缩成一个 zip，方便下载
-        Compress-Archive -Path main -DestinationPath Industrial-Vision-App.zip
+        Compress-Archive -Path main -DestinationPath Industrial-Vision-ONNX-App.zip
         
     - name: 6. 上传构建产物
       uses: actions/upload-artifact@v4
       with:
         name: Industrial-Vision-ONNX-App
-        path: industrial_vision_app/dist/Industrial-Vision-App.zip
+        path: industrial_vision_app/dist/Industrial-Vision-ONNX-App.zip
