@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.ERROR)
 ort.set_default_logger_severity(3)
 
 # ═══════════════════════════════════════════════════════════════
-# 极致推理引擎 (专为 Windows 异构加速设计)
+# 极致推理引擎 (张量级并行批量推理，榨干 GPU 算力)
 # ═══════════════════════════════════════════════════════════════
 
 class YOLO_ONNX_Detector:
@@ -69,53 +69,99 @@ class YOLO_ONNX_Detector:
         canvas[top:top + new_h, left:left + new_w] = resized
         return canvas, r, (left, top)
 
-    def _preprocess(self, frame: np.ndarray):
-        canvas, r, (left, top) = self._letterbox(frame)
-        canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        canvas = canvas.astype(np.float32) / 255.0
-        canvas = canvas.transpose(2, 0, 1)[None]  # [1, 3, 640, 640]
-        return canvas, r, left, top, frame.shape[:2]
-
-    def _postprocess(self, output: np.ndarray, r: float, left: int, top: int, orig_shape: tuple):
-        output = output[0].T  # [8400, 5] or [8400, 6]
-        scores = output[:, 4:].max(axis=1)
-        mask = scores > 0.5
+    # 极致优化的纯 Numpy NMS，告别 cv2.dnn 的低效
+    def _nms_numpy(self, boxes_xyxy, scores, iou_thres):
+        x1 = boxes_xyxy[:, 0]; y1 = boxes_xyxy[:, 1]
+        x2 = boxes_xyxy[:, 2]; y2 = boxes_xyxy[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = scores.argsort()[::-1]
         
-        if not np.any(mask):
-            return np.zeros((0, 6), dtype=np.float32)
-            
-        boxes_xywh = output[mask, :4]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            if order.size == 1: break
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0.0, xx2 - xx1 + 1)
+            h = np.maximum(0.0, yy2 - yy1 + 1)
+            inter = w * h
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            inds = np.where(ovr <= iou_thres)[0]
+            order = order[inds + 1]
+        return keep
+
+    def _postprocess(self, output, r, left, top, orig_shape):
+        # 健壮的维度处理：无论模型输出是 [84, 8400] 还是 [1, 84, 8400] 还是 [8400, 84]
+        out = output
+        if out.ndim == 3: out = out[0]  # 去掉 batch 维度
+        
+        # 如果第一维小于第二维，说明是 [84, 8400] 格式，需要转置
+        if out.shape[0] < out.shape[1]:
+            out = out.T  # 变成 [8400, 84]
+        
+        scores = out[:, 4:].max(axis=1)
+        mask = scores > 0.5
+        if not np.any(mask): return np.zeros((0, 6), dtype=np.float32)
+        
+        boxes = out[mask, :4]
         scores = scores[mask]
         
-        boxes_xyxy = np.zeros((len(boxes_xywh), 4), dtype=np.float32)
-        boxes_xyxy[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
-        boxes_xyxy[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
-        boxes_xyxy[:, 2] = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2
-        boxes_xyxy[:, 3] = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2
+        xyxy = np.zeros_like(boxes)
+        xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+        xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+        xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+        xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
         
-        indices = cv2.dnn.NMSBoxes(boxes_xyxy.tolist(), scores.tolist(), 0.5, 0.45)
-        if len(indices) == 0:
-            return np.zeros((0, 6), dtype=np.float32)
-            
-        indices = np.array(indices).flatten()
-        boxes_xyxy = boxes_xyxy[indices]
-        scores = scores[indices]
+        keep = self._nms_numpy(xyxy, scores, 0.45)
+        xyxy = xyxy[keep]
+        scores = scores[keep]
         
         orig_h, orig_w = orig_shape
-        boxes_xyxy[:, [0, 2]] = (boxes_xyxy[:, [0, 2]] - left) / r
-        boxes_xyxy[:, [1, 3]] = (boxes_xyxy[:, [1, 3]] - top) / r
-        boxes_xyxy[:, [0, 2]] = np.clip(boxes_xyxy[:, [0, 2]], 0, orig_w)
-        boxes_xyxy[:, [1, 3]] = np.clip(boxes_xyxy[:, [1, 3]], 0, orig_h)
+        xyxy[:, [0, 2]] = (xyxy[:, [0, 2]] - left) / r
+        xyxy[:, [1, 3]] = (xyxy[:, [1, 3]] - top) / r
+        xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0, orig_w)
+        xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0, orig_h)
         
-        cls_arr = np.zeros((len(boxes_xyxy), 1), dtype=np.float32)
-        return np.concatenate([boxes_xyxy, scores[:, None], cls_arr], axis=1)
+        cls_arr = np.zeros((len(xyxy), 1), dtype=np.float32)
+        return np.concatenate([xyxy, scores[:, None], cls_arr], axis=1)
 
+    # 🔥 核心重构：批量张量拼接，一次性送入 GPU
     def predict(self, frames: list):
-        all_boxes = []
+        if not frames: return []
+        
+        input_tensors = []
+        metas = []
         for frame in frames:
-            blob, r, left, top, orig_shape = self._preprocess(frame)
+            img, r, (left, top) = self._letterbox(frame)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = img.astype(np.float32) / 255.0
+            img = img.transpose(2, 0, 1)
+            input_tensors.append(img)
+            metas.append((r, left, top, frame.shape[:2]))
+            
+        # 拼接为 4D 张量 [16, 3, 640, 640]
+        blob = np.stack(input_tensors, axis=0)
+        
+        try:
+            # 一次推理 16 张图
             outputs = self.session.run(None, {self.input_name: blob})[0]
-            boxes = self._postprocess(outputs, r, left, top, orig_shape)
+            is_batch = outputs.shape[0] == len(frames)
+        except Exception:
+            # 如果模型不支持动态 batch，安全回退到单帧模式
+            outputs = []
+            for i in range(blob.shape[0]):
+                out = self.session.run(None, {self.input_name: blob[i:i+1]})[0]
+                outputs.append(out)
+            is_batch = False
+            
+        all_boxes = []
+        for i in range(len(frames)):
+            r, left, top, orig_shape = metas[i]
+            out = outputs[i] if is_batch else outputs[i][0]
+            boxes = self._postprocess(out, r, left, top, orig_shape)
             all_boxes.append(boxes)
         return all_boxes
 
@@ -596,7 +642,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("工业视觉效能透视终端 V13.0 — 极致异构级联架构")
+        self.setWindowTitle("工业视觉效能透视终端 V14.0 — 张量级并行架构")
         sg = QApplication.primaryScreen().availableGeometry()
         self.resize(min(2560, max(1200, int(sg.width() * 0.9))),
                     min(1440, max(800, int(sg.height() * 0.9))))
@@ -690,7 +736,7 @@ class MainWindow(QMainWindow):
             }}
             QTableWidget::item:hover {{ background-color: rgba(0, 240, 255, 0.08); }}
             QHeaderView::section {{
-                background-color: transparent; color: #58a6ff;
+                background-color: transparent; color: #58a6bb;
                 border: none; border-bottom: 1px solid rgba(0, 240, 255, 0.3);
                 font-weight: bold; font-family: {self.F_MO}; padding: 8px 4px;
             }}
@@ -1046,7 +1092,7 @@ class MainWindow(QMainWindow):
         self._clear_tables()
 
         self.is_preprocessing = True
-        self.lbl_original.setText("异构级联加速中...")
+        self.lbl_original.setText("张量并行加速中...")
         self.lbl_annotated.setText("AI 推理中...")
         self._set_status("正在调用 ONNX Runtime 极速预处理...", "warning")
 
@@ -1070,7 +1116,6 @@ class MainWindow(QMainWindow):
         self.current_result = result
         self._update_stats_ui(result)
 
-        # 获取当前真正使用的硬件设备
         device_name = getattr(self.preprocess_thread.model, 'active_device', 'CPU')
 
         if self.preprocess_thread.sm._is_bootstrapped:
@@ -1080,7 +1125,6 @@ class MainWindow(QMainWindow):
             anchor_status = "已焊死" if self.preprocess_thread.tracker.ref_box is not None else "锚定中..."
             self.lbl_engine_status.setText(
                 f"⚙ 引擎 [{device_name}]: 锚点{anchor_status} | 窗口:{win_size} | 边界: {min_b:.1f}s-{max_b:.1f}s")
-            # 如果是 GPU 就显示青色，如果是 CPU 就显示橙色
             color = "#00ff9d" if "GPU" in device_name else "#ffa500"
             self.lbl_engine_status.setStyleSheet(
                 f"font-size:12px; color:{color}; font-family:{self.F_MO}; border:none;")
