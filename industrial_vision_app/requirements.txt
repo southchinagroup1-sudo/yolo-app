@@ -1,0 +1,7 @@
+ultralytics
+PySide6
+opencv-python
+pandas
+matplotlib
+openpyxl
+pyinstaller
