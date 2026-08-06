@@ -1,0 +1,1 @@
+yolo detect train data=/home/ai/data_disk1/yolo/PJ1/yolo_dataset/data.yaml model=yolov8n.pt epochs=150 imgsz=640 batch=128 workers=8 device=0 patience=30
